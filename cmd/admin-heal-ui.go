@@ -27,9 +27,9 @@ import (
 	humanize "github.com/dustin/go-humanize"
 	"github.com/fatih/color"
 	json "github.com/minio/colorjson"
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 const (
@@ -52,7 +52,7 @@ var (
 
 func getHColCode(surplusShards, parityShards int) (c col, err error) {
 	if parityShards < 1 || parityShards > 8 || surplusShards > parityShards {
-		return c, fmt.Errorf("Invalid parity shard count/surplus shard count given")
+		return c, errors.New("Invalid parity shard count/surplus shard count given")
 	}
 	if surplusShards < 0 {
 		return colGrey, err
@@ -63,7 +63,7 @@ func getHColCode(surplusShards, parityShards int) (c col, err error) {
 			return hColOrder[index], err
 		}
 	}
-	return c, fmt.Errorf("cannot get a heal color code")
+	return c, errors.New("cannot get a heal color code")
 }
 
 type uiData struct {
@@ -127,7 +127,9 @@ func (ui *uiData) updateStats(i madmin.HealResultItem) error {
 	var afterCol col
 	h := newHRI(&i)
 	switch h.Type {
-	case madmin.HealItemMetadata, madmin.HealItemBucket:
+	case madmin.HealItemBucket:
+		_, afterCol, err = h.getBucketHCCChange()
+	case madmin.HealItemMetadata, madmin.HealItemBucketMetadata:
 		_, afterCol, err = h.getReplicatedFileHCCChange()
 	default:
 		_, afterCol, err = h.getObjectHCCChange()
@@ -205,17 +207,24 @@ func (ui *uiData) printItemsQuietly(s *madmin.HealTaskStatus) (err error) {
 	var b, a col
 	for _, item := range s.Items {
 		h := newHRI(&item)
+		hrStr := h.getHealResultStr()
 		switch h.Type {
-		case madmin.HealItemMetadata, madmin.HealItemBucket:
+		case madmin.HealItemBucket:
+			b, a, err = h.getBucketHCCChange()
+		case madmin.HealItemMetadata, madmin.HealItemBucketMetadata:
 			b, a, err = h.getReplicatedFileHCCChange()
 		default:
 			b, a, err = h.getObjectHCCChange()
 		}
 		if err != nil {
-			return err
+			errMsg := err.Error()
+			if h.Detail != "" {
+				errMsg = h.Detail
+			}
+			console.PrintC("[ERROR] ** ", hrStr, " **", ": ", errMsg, "\n")
+			continue
 		}
 		printColStr(b, a)
-		hrStr := h.getHealResultStr()
 		switch h.Type {
 		case madmin.HealItemMetadata, madmin.HealItemBucketMetadata:
 			console.PrintC(fmt.Sprintln("**", hrStr, "**"))
@@ -226,7 +235,7 @@ func (ui *uiData) printItemsQuietly(s *madmin.HealTaskStatus) (err error) {
 	return nil
 }
 
-func (ui *uiData) printStatsQuietly(s *madmin.HealTaskStatus) {
+func (ui *uiData) printStatsQuietly() {
 	totalObjects, totalSize, totalTime := ui.getProgress()
 
 	healedStr := fmt.Sprintf("Healed:\t%s/%s objects; %s in %s\n",
@@ -240,6 +249,7 @@ func (ui *uiData) printItemsJSON(s *madmin.HealTaskStatus) (err error) {
 	type healRec struct {
 		Status string `json:"status"`
 		Error  string `json:"error,omitempty"`
+		Detail string `json:"detail,omitempty"`
 		Type   string `json:"type"`
 		Name   string `json:"name"`
 		Before struct {
@@ -267,7 +277,9 @@ func (ui *uiData) printItemsJSON(s *madmin.HealTaskStatus) (err error) {
 		var b, a col
 		var err error
 		switch h.Type {
-		case madmin.HealItemMetadata, madmin.HealItemBucket:
+		case madmin.HealItemBucket:
+			b, a, err = h.getBucketHCCChange()
+		case madmin.HealItemMetadata, madmin.HealItemBucketMetadata:
 			b, a, err = h.getReplicatedFileHCCChange()
 		default:
 			if h.Type == madmin.HealItemObject {
@@ -278,6 +290,7 @@ func (ui *uiData) printItemsJSON(s *madmin.HealTaskStatus) (err error) {
 		if err != nil {
 			r.Error = err.Error()
 		}
+		r.Detail = h.Detail
 		r.Before.Color = strings.ToLower(string(b))
 		r.After.Color = strings.ToLower(string(a))
 		r.Before.Online, r.After.Online = h.GetOnlineCounts()
@@ -291,14 +304,14 @@ func (ui *uiData) printItemsJSON(s *madmin.HealTaskStatus) (err error) {
 
 	for _, item := range s.Items {
 		h := newHRI(&item)
-		jsonBytes, err := json.MarshalIndent(makeHR(h), "", " ")
-		fatalIf(probe.NewError(err), "Unable to marshal to JSON.")
+		jsonBytes, e := json.MarshalIndent(makeHR(h), "", " ")
+		fatalIf(probe.NewError(e), "Unable to marshal to JSON.")
 		console.Println(string(jsonBytes))
 	}
 	return nil
 }
 
-func (ui *uiData) printStatsJSON(s *madmin.HealTaskStatus) {
+func (ui *uiData) printStatsJSON(_ *madmin.HealTaskStatus) {
 	var summary struct {
 		Status         string `json:"status"`
 		Error          string `json:"error,omitempty"`
@@ -321,8 +334,8 @@ func (ui *uiData) printStatsJSON(s *madmin.HealTaskStatus) {
 	summary.Size = ui.BytesScanned
 	summary.ElapsedTime = int64(ui.HealDuration.Round(time.Second).Seconds())
 
-	jBytes, err := json.MarshalIndent(summary, "", " ")
-	fatalIf(probe.NewError(err), "Unable to marshal to JSON.")
+	jBytes, e := json.MarshalIndent(summary, "", " ")
+	fatalIf(probe.NewError(e), "Unable to marshal to JSON.")
 	console.Println(string(jBytes))
 }
 
@@ -369,7 +382,7 @@ func (ui *uiData) updateUI(s *madmin.HealTaskStatus) (err error) {
 	return nil
 }
 
-func (ui *uiData) UpdateDisplay(s *madmin.HealTaskStatus) (err error) {
+func (ui *uiData) UpdateDisplay(s *madmin.HealTaskStatus) {
 	// Update state
 	ui.updateDuration(s)
 	for _, i := range s.Items {
@@ -379,11 +392,11 @@ func (ui *uiData) UpdateDisplay(s *madmin.HealTaskStatus) (err error) {
 	// Update display
 	switch {
 	case globalJSON:
-		err = ui.printItemsJSON(s)
+		ui.printItemsJSON(s)
 	case globalQuiet:
-		err = ui.printItemsQuietly(s)
+		ui.printItemsQuietly(s)
 	default:
-		err = ui.updateUI(s)
+		ui.updateUI(s)
 	}
 	return
 }
@@ -420,16 +433,14 @@ func (ui *uiData) DisplayAndFollowHealStatus(aliasedURL string) (res madmin.Heal
 					console.RewindLines(8)
 				}
 			}
-			err = ui.UpdateDisplay(&res)
-			if err != nil {
-				return res, err
-			}
+
+			ui.UpdateDisplay(&res)
 
 			if res.Summary == "finished" {
 				if globalJSON {
 					ui.printStatsJSON(&res)
 				} else if globalQuiet {
-					ui.printStatsQuietly(&res)
+					ui.printStatsQuietly()
 				}
 				return res, nil
 			}
