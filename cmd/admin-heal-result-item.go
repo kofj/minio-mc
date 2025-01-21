@@ -18,9 +18,10 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 )
 
 type hri struct {
@@ -49,8 +50,48 @@ func (h hri) getObjectHCCChange() (b, a col, err error) {
 	}
 	a, err = getHColCode(surplusShardsAfterHeal, parityShards)
 	if err != nil {
-		err = fmt.Errorf("%w: surplusShardsBeforeHeal: %d, parityShards: %d",
+		err = fmt.Errorf("%w: surplusShardsAfterHeal: %d, parityShards: %d",
 			err, surplusShardsAfterHeal, parityShards)
+	}
+	return
+}
+
+// getBucketHCCChange - fetches health color code for bucket healing
+// this does not return a Grey color since it does not have any meaning
+// for a bucket healing. Return green if the bucket is found in a drive,
+// yellow for missing, and red for everything else, grey for weird situations
+func (h hri) getBucketHCCChange() (b, a col, err error) {
+	if h.HealResultItem == nil {
+		return colGrey, colGrey, errors.New("empty result")
+	}
+
+	getColCode := func(drives []madmin.HealDriveInfo) (c col) {
+		var missing, unavailable int
+		for i := range drives {
+			switch drives[i].State {
+			case madmin.DriveStateOk:
+			case madmin.DriveStateMissing:
+				missing++
+			default:
+				unavailable++
+			}
+		}
+		if unavailable > 0 {
+			return colRed
+		}
+		if missing > 0 {
+			return colYellow
+		}
+		return colGreen
+	}
+
+	a, b = colGrey, colGrey
+
+	if len(h.HealResultItem.Before.Drives) > 0 {
+		b = getColCode(h.HealResultItem.Before.Drives)
+	}
+	if len(h.HealResultItem.After.Drives) > 0 {
+		a = getColCode(h.HealResultItem.After.Drives)
 	}
 	return
 }
@@ -61,9 +102,18 @@ func (h hri) getReplicatedFileHCCChange() (b, a col, err error) {
 	getColCode := func(numAvail int) (c col, err error) {
 		// calculate color code for replicated object similar
 		// to erasure coded objects
-		quorum := h.DiskCount/h.SetCount/2 + 1
-		surplus := numAvail/h.SetCount - quorum
-		parity := h.DiskCount/h.SetCount - quorum
+		var quorum, surplus, parity int
+		if h.SetCount > 0 {
+			quorum = h.DiskCount/h.SetCount/2 + 1
+			surplus = numAvail/h.SetCount - quorum
+			parity = h.DiskCount/h.SetCount - quorum
+		} else {
+			// in case of bucket healing, disk count is for the node
+			// also explicitly set count would be set to invalid value of -1
+			quorum = h.DiskCount/2 + 1
+			surplus = numAvail - quorum
+			parity = h.DiskCount - quorum
+		}
 		c, err = getHColCode(surplus, parity)
 		return
 	}

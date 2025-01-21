@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2022 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -18,9 +18,11 @@
 package cmd
 
 import (
+	"bufio"
 	"fmt"
 	"math"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -30,9 +32,9 @@ import (
 	"github.com/fatih/color"
 	"github.com/minio/cli"
 	json "github.com/minio/colorjson"
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 const (
@@ -41,48 +43,74 @@ const (
 )
 
 var adminHealFlags = []cli.Flag{
-	cli.StringFlag{
-		Name:  "scan",
-		Usage: "select the healing scan mode (normal/deep)",
-		Value: scanNormalMode,
+	cli.IntFlag{
+		Name:   "pool",
+		Usage:  "heal only the given pool",
+		Hidden: true,
 	},
-	cli.BoolFlag{
-		Name:  "recursive, r",
-		Usage: "heal recursively",
-	},
-	cli.BoolFlag{
-		Name:  "dry-run, n",
-		Usage: "only inspect data, but do not mutate",
-	},
-	cli.BoolFlag{
-		Name:  "force-start, f",
-		Usage: "force start a new heal sequence",
-	},
-	cli.BoolFlag{
-		Name:  "force-stop, s",
-		Usage: "force stop a running heal sequence",
-	},
-	cli.BoolFlag{
-		Name:  "remove",
-		Usage: "remove dangling objects in heal sequence",
+	cli.IntFlag{
+		Name:   "set",
+		Usage:  "heal only the given set",
+		Hidden: true,
 	},
 	cli.StringFlag{
-		Name:  "storage-class",
-		Usage: "show server/drives failure tolerance with the given storage class",
+		Name:   "scan",
+		Usage:  "select the healing scan mode (normal/deep)",
+		Value:  scanNormalMode,
+		Hidden: true,
 	},
 	cli.BoolFlag{
-		Name:  "rewrite",
-		Usage: "rewrite objects from older to newer format",
+		Name:   "recursive, r",
+		Usage:  "heal recursively",
+		Hidden: true,
+	},
+	cli.BoolFlag{
+		Name:   "dry-run, n",
+		Usage:  "only inspect data, but do not mutate",
+		Hidden: true,
+	},
+	cli.BoolFlag{
+		Name:   "force-start, f",
+		Usage:  "force start a new heal sequence",
+		Hidden: true,
+	},
+	cli.BoolFlag{
+		Name:   "force-stop, s",
+		Usage:  "force stop a running heal sequence",
+		Hidden: true,
+	},
+	cli.BoolFlag{
+		Name:  "force",
+		Usage: "avoid showing a warning prompt",
+	},
+	cli.BoolFlag{
+		Name:   "remove",
+		Usage:  "remove dangling objects in heal sequence",
+		Hidden: true,
+	},
+	cli.StringFlag{
+		Name:   "storage-class",
+		Usage:  "show server/drives failure tolerance with the given storage class",
+		Hidden: true,
+	},
+	cli.BoolFlag{
+		Name:   "rewrite",
+		Usage:  "rewrite objects from older to newer format",
+		Hidden: true,
 	},
 	cli.BoolFlag{
 		Name:  "verbose, v",
 		Usage: "show verbose information",
 	},
+	cli.BoolFlag{
+		Name:  "all-drives, a",
+		Usage: "select all drives for verbose printing",
+	},
 }
 
 var adminHealCmd = cli.Command{
 	Name:            "heal",
-	Usage:           "heal bucket(s) and object(s) on MinIO server",
+	Usage:           "monitor healing for bucket(s) and object(s) on MinIO server",
 	Action:          mainAdminHeal,
 	OnUsageError:    onUsageError,
 	Before:          setGlobalsFromContext,
@@ -144,34 +172,27 @@ type poolInfo struct {
 	endpoints []string
 }
 
-type diskInfo struct {
-	set   setIndex
-	path  string
-	state string
-
-	healStarted, healLastUpdate time.Time
-
-	usedSpace, totalSpace uint64
-}
-
 type setInfo struct {
-	maxUsedSpace   uint64
-	totalDisks     int
+	totalDisks int
+
+	readyDisksCount     int    // disks online and not in healing state
+	readyDisksUsedSpace uint64 // the total used space of ready disks
+
 	incapableDisks int
 }
 
 type serverInfo struct {
 	pool  int
-	disks []diskInfo
+	disks []madmin.Disk
 }
 
 func (s serverInfo) onlineDisksForSet(index setIndex) (setFound bool, count int) {
 	for _, disk := range s.disks {
-		if disk.set != index {
+		if disk.PoolIndex != index.pool || disk.SetIndex != index.set {
 			continue
 		}
 		setFound = true
-		if disk.state == "ok" && disk.healStarted.IsZero() {
+		if disk.State == "ok" && !disk.Healing {
 			count++
 		}
 	}
@@ -211,11 +232,11 @@ func generateSetsStatus(disks []madmin.Disk) map[setIndex]setInfo {
 			setSt = setInfo{}
 		}
 		setSt.totalDisks++
-		if d.UsedSpace > setSt.maxUsedSpace {
-			setSt.maxUsedSpace = d.UsedSpace
-		}
 		if d.State != "ok" || d.Healing {
 			setSt.incapableDisks++
+		} else {
+			setSt.readyDisksCount++
+			setSt.readyDisksUsedSpace += d.UsedSpace
 		}
 		m[idx] = setSt
 	}
@@ -226,8 +247,8 @@ func generateSetsStatus(disks []madmin.Disk) map[setIndex]setInfo {
 func generateServersStatus(disks []madmin.Disk) map[string]serverInfo {
 	m := make(map[string]serverInfo)
 	for _, d := range disks {
-		u, err := url.Parse(d.Endpoint)
-		if err != nil {
+		u, e := url.Parse(d.Endpoint)
+		if e != nil {
 			continue
 		}
 		endpoint := u.Host
@@ -240,21 +261,7 @@ func generateServersStatus(disks []madmin.Disk) map[string]serverInfo {
 				pool: d.PoolIndex,
 			}
 		}
-		setIndex := setIndex{pool: d.PoolIndex, set: d.SetIndex}
-		di := diskInfo{
-			set:        setIndex,
-			path:       u.Path,
-			state:      d.State,
-			usedSpace:  d.UsedSpace,
-			totalSpace: d.TotalSpace,
-		}
-
-		if d.HealInfo != nil {
-			di.healStarted = d.HealInfo.Started
-			di.healLastUpdate = d.HealInfo.LastUpdate
-		}
-
-		serverSt.disks = append(serverSt.disks, di)
+		serverSt.disks = append(serverSt.disks, d)
 		m[endpoint] = serverSt
 	}
 	return m
@@ -334,6 +341,8 @@ type verboseBackgroundHealStatusMessage struct {
 	Status   string `json:"status"`
 	HealInfo madmin.BgHealState
 
+	allDrives bool
+
 	// Specify storage class to show servers/disks tolerance
 	ToleranceForSC string `json:"-"`
 }
@@ -378,47 +387,73 @@ func (s verboseBackgroundHealStatusMessage) String() string {
 			_, ok := offlineEndpoints[endpoint]
 			if ok {
 				stateText := console.Colorize("NodeFailed", "OFFLINE")
-				fmt.Fprintf(&msg, fmt.Sprintf("  %s: %s\n", endpoint, stateText))
+				fmt.Fprintf(&msg, "  %s: %s\n", endpoint, stateText)
 				continue
 			}
+			var serverHeader strings.Builder
+			var serverHeaderPrinted bool
 			serverStatus := serversStatus[endpoint]
 			switch {
 			case showTolerance:
-				serverHeader := "  %s: (Tolerance: %d server(s))\n"
-				fmt.Fprintf(&msg, fmt.Sprintf(serverHeader, endpoint, poolsInfo[serverStatus.pool].tolerance))
+				hdr := "  %s: (Tolerance: %d server(s))\n"
+				fmt.Fprintf(&serverHeader, hdr, endpoint, poolsInfo[serverStatus.pool].tolerance)
 			default:
-				serverHeader := "  %s:\n"
-				fmt.Fprintf(&msg, fmt.Sprintf(serverHeader, endpoint))
+				hdr := "  %s:\n"
+				fmt.Fprintf(&serverHeader, hdr, endpoint)
 			}
 
 			for _, d := range serverStatus.disks {
-				if d.set.pool != pool {
+				if d.PoolIndex != pool {
 					continue
 				}
 				stateText := ""
 				switch {
-				case d.state == "ok" && !d.healStarted.IsZero():
+				case d.State == "ok" && d.Healing:
 					stateText = console.Colorize("DiskHealing", "HEALING")
-				case d.state == "ok":
+				case d.State == "ok":
+					if !s.allDrives {
+						continue
+					}
 					stateText = console.Colorize("DiskOK", "OK")
 				default:
-					stateText = console.Colorize("DiskFailed", d.state)
+					stateText = console.Colorize("DiskFailed", d.State)
 				}
-				fmt.Fprintf(&msg, "  +  %s : %s\n", d.path, stateText)
-				if !d.healStarted.IsZero() {
-					now := time.Now().UTC()
-					scanSpeed := float64(d.usedSpace) / float64(now.Sub(d.healStarted))
-					remainingTime := time.Duration(float64(setsStatus[d.set].maxUsedSpace-d.usedSpace) / scanSpeed)
-					estimationText := humanize.RelTime(now, now.Add(remainingTime), "", "")
-					fmt.Fprintf(&msg, "  |__ Estimated: %s\n", estimationText)
+				if !serverHeaderPrinted {
+					serverHeaderPrinted = true
+					fmt.Fprint(&msg, serverHeader.String())
 				}
-				fmt.Fprintf(&msg, "  |__  Capacity: %s/%s\n", humanize.IBytes(d.usedSpace), humanize.IBytes(d.totalSpace))
+				drivePath := d.DrivePath
+				if drivePath == "" {
+					if u, e := url.Parse(d.Endpoint); e == nil {
+						drivePath = u.Path
+					}
+				}
+				fmt.Fprintf(&msg, "  +  %s : %s\n", drivePath, stateText)
+
+				thisSet := setsStatus[setIndex{d.PoolIndex, d.SetIndex}]
+				if d.Healing && d.HealInfo != nil && !d.HealInfo.Finished {
+					refUsedSpace := uint64(math.MaxUint64)
+					if thisSet.readyDisksCount > 0 { // to avoid crashing
+						refUsedSpace = thisSet.readyDisksUsedSpace / uint64(thisSet.readyDisksCount)
+					}
+					if refUsedSpace < d.UsedSpace { // normalize
+						refUsedSpace = d.UsedSpace
+					}
+					fmt.Fprintf(&msg, "  |__   Progress: %d%%\n", 100*d.UsedSpace/refUsedSpace)
+					fmt.Fprintf(&msg, "  |__    Started: %s\n", humanize.Time(d.HealInfo.Started))
+					if d.HealInfo.RetryAttempts > 0 {
+						fmt.Fprintf(&msg, "  |__    Retries: %d\n", d.HealInfo.RetryAttempts)
+					}
+				}
+				fmt.Fprintf(&msg, "  |__   Capacity: %s/%s\n", humanize.IBytes(d.UsedSpace), humanize.IBytes(d.TotalSpace))
 				if showTolerance {
-					fmt.Fprintf(&msg, "  |__ Tolerance: %d drive(s)\n", parity-setsStatus[d.set].incapableDisks)
+					fmt.Fprintf(&msg, "  |__  Tolerance: %d drive(s)\n", parity-thisSet.incapableDisks)
 				}
 			}
 
-			fmt.Fprintf(&msg, "\n")
+			if serverHeaderPrinted {
+				fmt.Fprintf(&msg, "\n")
+			}
 		}
 	}
 
@@ -439,11 +474,11 @@ func (s verboseBackgroundHealStatusMessage) String() string {
 
 	summary := shortBackgroundHealStatusMessage{HealInfo: s.HealInfo}
 
-	fmt.Fprintf(&msg, "\n")
-	fmt.Fprintf(&msg, "Summary:\n")
-	fmt.Fprintf(&msg, "=======\n")
-	fmt.Fprintf(&msg, summary.String())
-	fmt.Fprintf(&msg, "\n")
+	fmt.Fprint(&msg, "\n")
+	fmt.Fprint(&msg, "Summary:\n")
+	fmt.Fprint(&msg, "=======\n")
+	fmt.Fprint(&msg, summary.String())
+	fmt.Fprint(&msg, "\n")
 
 	return msg.String()
 }
@@ -466,8 +501,6 @@ type shortBackgroundHealStatusMessage struct {
 func (s shortBackgroundHealStatusMessage) String() string {
 	healPrettyMsg := ""
 	var (
-		totalItems         uint64
-		totalBytes         uint64
 		itemsHealed        uint64
 		bytesHealed        uint64
 		itemsFailed        uint64
@@ -481,12 +514,10 @@ func (s shortBackgroundHealStatusMessage) String() string {
 		// The addition of Elapsed time of each parallel healing operation
 		// this is needed to calculate the rate of healing
 		accumulatedElapsedTime time.Duration
-
-		// ETA of healing - it is the latest ETA of all drives currently healing
-		healingRemaining time.Duration
 	)
 
 	var problematicDisks int
+	leastPct := 100.0
 
 	for _, set := range s.HealInfo.Sets {
 		setsStatus := generateSetsStatus(set.Disks)
@@ -503,8 +534,26 @@ func (s shortBackgroundHealStatusMessage) String() string {
 				continue
 			}
 
-			if disk.HealInfo != nil {
+			if disk.HealInfo != nil && !disk.HealInfo.Finished {
 				missingInSet++
+
+				thisSet := setsStatus[setIndex{pool: disk.PoolIndex, set: disk.SetIndex}]
+				refUsedSpace := uint64(math.MaxUint64)
+				if thisSet.readyDisksCount > 0 {
+					refUsedSpace = thisSet.readyDisksUsedSpace / uint64(thisSet.readyDisksCount)
+				}
+				if refUsedSpace < disk.UsedSpace {
+					refUsedSpace = disk.UsedSpace
+				}
+				if refUsedSpace > 0 {
+					if pct := float64(disk.UsedSpace) / float64(refUsedSpace); pct < leastPct {
+						leastPct = pct
+					}
+				} else {
+					// Unlikely to have max used space in an erasure set to be zero, but still set this to zero
+					leastPct = 0
+				}
+
 				disk := disk
 				if furthestHealingDisk == nil {
 					furthestHealingDisk = &disk
@@ -516,13 +565,11 @@ func (s shortBackgroundHealStatusMessage) String() string {
 				}
 			}
 		}
+
 		if furthestHealingDisk != nil {
 			disk := furthestHealingDisk
-			diskSet := setIndex{pool: disk.PoolIndex, set: disk.SetIndex}
 
 			// Approximate values
-			totalItems += disk.HealInfo.ObjectsTotalCount
-			totalBytes += disk.HealInfo.ObjectsTotalSize
 			itemsHealed += disk.HealInfo.ItemsHealed
 			bytesHealed += disk.HealInfo.BytesDone
 			bytesFailed += disk.HealInfo.BytesFailed
@@ -540,11 +587,6 @@ func (s shortBackgroundHealStatusMessage) String() string {
 				bytesHealedPerSec += float64(time.Second) * float64(disk.HealInfo.BytesDone) / float64(disk.HealInfo.LastUpdate.Sub(disk.HealInfo.Started))
 				itemsHealedPerSec += float64(time.Second) * float64(disk.HealInfo.ItemsHealed+disk.HealInfo.ItemsFailed) / float64(disk.HealInfo.LastUpdate.Sub(disk.HealInfo.Started))
 
-				scanSpeed := float64(disk.UsedSpace) / float64(time.Now().Sub(disk.HealInfo.Started))
-				remainingTime := time.Duration(float64(setsStatus[diskSet].maxUsedSpace-disk.UsedSpace) / scanSpeed)
-				if remainingTime > healingRemaining {
-					healingRemaining = remainingTime
-				}
 			}
 			if n, ok := s.HealInfo.SCParity["STANDARD"]; ok && missingInSet > n {
 				setsExceedsStd++
@@ -556,7 +598,7 @@ func (s shortBackgroundHealStatusMessage) String() string {
 	}
 
 	if startedAt.IsZero() && itemsHealed == 0 {
-		healPrettyMsg += "No active healing is detected among disks"
+		healPrettyMsg += "No active healing is detected for new disks"
 		if problematicDisks > 0 {
 			healPrettyMsg += fmt.Sprintf(", though %d offline disk(s) found.", problematicDisks)
 		} else {
@@ -565,33 +607,14 @@ func (s shortBackgroundHealStatusMessage) String() string {
 		return healPrettyMsg
 	}
 
-	if totalItems > 0 && totalBytes > 0 {
-		// Objects healed information
-		itemsPct := math.Min(100, 100*float64(itemsHealed)/float64(totalItems))
-		bytesPct := math.Min(100, 100*float64(bytesHealed)/float64(totalBytes))
-
-		healPrettyMsg += fmt.Sprintf("Objects Healed: %s/%s (%s), %s/%s (%s)\n",
-			humanize.Comma(int64(itemsHealed)), humanize.Comma(int64(totalItems)), humanize.CommafWithDigits(itemsPct, 1)+"%%",
-			humanize.Bytes(bytesHealed), humanize.Bytes(totalBytes), humanize.CommafWithDigits(bytesPct, 1)+"%%")
-
-		if itemsFailed > 0 {
-			itemsPct := math.Min(100, 100*float64(itemsFailed)/float64(totalItems))
-			bytesPct := math.Min(100, 100*float64(bytesFailed)/float64(totalBytes))
-			healPrettyMsg += fmt.Sprintf("Objects Failed: %s/%s (%s), %s/%s (%s)\n",
-				humanize.Comma(int64(itemsFailed)), humanize.Comma(int64(totalItems)), humanize.CommafWithDigits(itemsPct, 1)+"%%",
-				humanize.Bytes(bytesFailed), humanize.Bytes(totalBytes), humanize.CommafWithDigits(bytesPct, 1)+"%%")
-		}
-	} else {
-		healPrettyMsg += fmt.Sprintf("Objects Healed: %s, %s\n", humanize.Comma(int64(itemsHealed)), humanize.Bytes(bytesHealed))
-	}
+	// Objects healed information
+	healPrettyMsg += fmt.Sprintf("Objects Healed: %s, %s (%s)\n",
+		humanize.Comma(int64(itemsHealed)), humanize.IBytes(bytesHealed), humanize.CommafWithDigits(leastPct*100, 1)+"%")
+	healPrettyMsg += fmt.Sprintf("Objects Failed: %s\n", humanize.Comma(int64(itemsFailed)))
 
 	if accumulatedElapsedTime > 0 {
 		healPrettyMsg += fmt.Sprintf("Heal rate: %d obj/s, %s/s\n", int64(itemsHealedPerSec), humanize.IBytes(uint64(bytesHealedPerSec)))
 	}
-
-	// Estimation completion
-	now := time.Now()
-	healPrettyMsg += fmt.Sprintf("Estimated Completion: %s\n", humanize.RelTime(now, now.Add(healingRemaining), "", ""))
 
 	if problematicDisks > 0 {
 		healPrettyMsg += "\n"
@@ -666,12 +689,13 @@ func mainAdminHeal(ctx *cli.Context) error {
 	// Return the background heal status when the user
 	// doesn't pass a bucket or --recursive flag.
 	if bucket == "" && !ctx.Bool("recursive") {
-		bgHealStatus, berr := adminClnt.BackgroundHealStatus(globalContext)
-		fatalIf(probe.NewError(berr), "Failed to get the status of the background heal.")
+		bgHealStatus, e := adminClnt.BackgroundHealStatus(globalContext)
+		fatalIf(probe.NewError(e), "Unable to get background heal status.")
 		if ctx.Bool("verbose") {
 			printMsg(verboseBackgroundHealStatusMessage{
 				Status:         "success",
 				HealInfo:       bgHealStatus,
+				allDrives:      ctx.Bool("all-drives"),
 				ToleranceForSC: strings.ToUpper(ctx.String("storage-class")),
 			})
 		} else {
@@ -683,13 +707,6 @@ func mainAdminHeal(ctx *cli.Context) error {
 		return nil
 	}
 
-	for content := range clnt.List(globalContext, ListOptions{Recursive: false, ShowDir: DirNone}) {
-		if content.Err != nil {
-			fatalIf(content.Err.Trace(clnt.GetURL().String()), "Unable to heal bucket `"+bucket+"`.")
-			return nil
-		}
-	}
-
 	opts := madmin.HealOpts{
 		ScanMode:  transformScanArg(ctx.String("scan")),
 		Remove:    ctx.Bool("remove"),
@@ -698,17 +715,45 @@ func mainAdminHeal(ctx *cli.Context) error {
 		Recreate:  ctx.Bool("rewrite"),
 	}
 
+	if ctx.IsSet("pool") {
+		p := ctx.Int("pool")
+		if p < 1 {
+			fatalIf(errInvalidArgument(), "--pool takes a non zero positive number.")
+		}
+		p--
+		opts.Pool = &p
+	}
+
+	if ctx.IsSet("set") {
+		s := ctx.Int("set")
+		if s < 1 {
+			fatalIf(errInvalidArgument(), "--set takes a non zero positive number.")
+		}
+		s--
+		opts.Set = &s
+	}
+
 	forceStart := ctx.Bool("force-start")
 	forceStop := ctx.Bool("force-stop")
 	if forceStop {
-		_, _, herr := adminClnt.Heal(globalContext, bucket, prefix, opts, "", forceStart, forceStop)
-		fatalIf(probe.NewError(herr), "Failed to stop heal sequence.")
+		_, _, e := adminClnt.Heal(globalContext, bucket, prefix, opts, "", forceStart, forceStop)
+		fatalIf(probe.NewError(e), "Unable to stop healing.")
 		printMsg(stopHealMessage{Status: "success", Alias: aliasedURL})
 		return nil
 	}
 
-	healStart, _, herr := adminClnt.Heal(globalContext, bucket, prefix, opts, "", forceStart, false)
-	fatalIf(probe.NewError(herr), "Failed to start heal sequence.")
+	if opts.Recursive && opts.Pool == nil && opts.Set == nil && isTerminal() && !ctx.Bool("force") {
+		fmt.Printf("You are about to scan and heal the whole namespace in all pools and sets, please confirm [y/N]: ")
+		answer, e := bufio.NewReader(os.Stdin).ReadString('\n')
+		fatalIf(probe.NewError(e), "Unable to parse user input.")
+		if answer = strings.TrimSpace(strings.ToLower(answer)); answer != "y" && answer != "yes" {
+			fmt.Println("Heal aborted!")
+			return nil
+		}
+	}
+
+	healStart, _, e := adminClnt.Heal(globalContext, bucket, prefix, opts, "", forceStart, false)
+	fatalIf(probe.NewError(e), "Unable to start healing.")
 
 	ui := uiData{
 		Bucket:                bucket,

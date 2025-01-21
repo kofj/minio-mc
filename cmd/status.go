@@ -22,7 +22,7 @@ import (
 	"sync/atomic"
 
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 // Status implements a interface that can be used in quit mode or with progressbar.
@@ -87,12 +87,12 @@ func (qs *QuietStatus) AddCounts(v int64) {
 
 // SetTotal sets the total of the progressbar, ignored for quietstatus
 func (qs *QuietStatus) SetTotal(v int64) Status {
-	qs.accounter.Set(v)
+	qs.accounter.SetTotal(v)
 	return qs
 }
 
 // SetCaption sets the caption of the progressbar, ignored for quietstatus
-func (qs *QuietStatus) SetCaption(s string) {
+func (qs *QuietStatus) SetCaption(_ string) {
 }
 
 // Get returns the current number of bytes
@@ -112,7 +112,7 @@ func (qs *QuietStatus) Add(v int64) Status {
 }
 
 // Println prints line, ignored for quietstatus
-func (qs *QuietStatus) Println(data ...interface{}) {
+func (qs *QuietStatus) Println(_ ...interface{}) {
 }
 
 // PrintMsg prints message
@@ -134,11 +134,11 @@ func (qs *QuietStatus) Update() {
 }
 
 func (qs *QuietStatus) errorIf(err *probe.Error, msg string) {
-	errorIf(err, msg)
+	errorIf(err, "%s", msg)
 }
 
 func (qs *QuietStatus) fatalIf(err *probe.Error, msg string) {
-	fatalIf(err, msg)
+	fatalIf(err, "%s", msg)
 }
 
 // NewProgressStatus returns a progress status object
@@ -214,7 +214,7 @@ func (ps *ProgressStatus) Println(data ...interface{}) {
 }
 
 // PrintMsg prints message
-func (ps *ProgressStatus) PrintMsg(msg message) {
+func (ps *ProgressStatus) PrintMsg(_ message) {
 }
 
 // Start is ignored for quietstatus
@@ -235,7 +235,7 @@ func (ps *ProgressStatus) Update() {
 func (ps *ProgressStatus) errorIf(err *probe.Error, msg string) {
 	// remove progressbar
 	console.Eraseline()
-	errorIf(err, msg)
+	errorIf(err, "%s", msg)
 
 	ps.progressBar.Update()
 }
@@ -243,7 +243,7 @@ func (ps *ProgressStatus) errorIf(err *probe.Error, msg string) {
 func (ps *ProgressStatus) fatalIf(err *probe.Error, msg string) {
 	// remove progressbar
 	console.Eraseline()
-	fatalIf(err, msg)
+	fatalIf(err, "%s", msg)
 
 	ps.progressBar.Update()
 }

@@ -26,7 +26,7 @@ import (
 	json "github.com/minio/colorjson"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7"
-	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 // Structured message depending on the type of console.
@@ -95,10 +95,10 @@ func (m retentionBucketMessage) String() string {
 		return console.Colorize("RetentionSuccess", "Object lock configuration cleared successfully.")
 	}
 	// info/set command
-	if m.Mode == "" {
-		return console.Colorize("RetentionNotFound", "Object locking configuration is not enabled.")
+	if !m.Mode.IsValid() {
+		return console.Colorize("RetentionNotFound", "Object locking is not enabled.")
 	}
-	return console.Colorize("RetentionSuccess", fmt.Sprintf("Object locking configuration '%s' is enabled for %s.",
+	return console.Colorize("RetentionSuccess", fmt.Sprintf("Object locking '%s' is configured for %s.",
 		console.Colorize("Mode", m.Mode), console.Colorize("Validity", m.Validity)))
 }
 
@@ -170,16 +170,15 @@ func parseRetentionValidity(validityStr string) (uint64, minio.ValidityUnit, *pr
 	return validity, unit, nil
 }
 
-func fatalIfBucketLockNotEnabled(ctx context.Context, aliasedURL string) {
-	enabled, err := getBucketLockStatus(ctx, aliasedURL)
-	fatalIf(err.Trace(), "Unable to get bucket lock configuration from `%s`", aliasedURL)
-	if enabled != "Enabled" {
-		fatalIf(errDummy().Trace(), "Remote bucket does not support locking `%s`", aliasedURL)
+func fatalIfBucketLockNotSupported(ctx context.Context, aliasedURL string) {
+	_, err := getBucketLockStatus(ctx, aliasedURL)
+	if err != nil {
+		fatalIf(errDummy().Trace(), "Remote bucket `%s` does not support locking", aliasedURL)
 	}
 }
 
 // Apply Retention for one object/version or many objects within a given prefix.
-func applyRetention(ctx context.Context, op lockOpType, target, versionID string, timeRef time.Time, withOlderVersions, isRecursive bool,
+func applyRetention(ctx context.Context, op lockOpType, target, versionID string, timeRef time.Time, withVersions, isRecursive bool,
 	mode minio.RetentionMode, validity uint64, unit minio.ValidityUnit, bypassGovernance bool,
 ) error {
 	clnt, err := newClient(target)
@@ -208,7 +207,7 @@ func applyRetention(ctx context.Context, op lockOpType, target, versionID string
 	}
 
 	alias, urlStr, _ := mustExpandAlias(target)
-	if versionID != "" || !isRecursive && !withOlderVersions {
+	if versionID != "" || !isRecursive && !withVersions {
 		err := setRetentionSingle(ctx, op, alias, urlStr, versionID, mode, until, bypassGovernance)
 		fatalIf(err.Trace(), "Unable to set retention on `%s`", target)
 		return nil
@@ -216,7 +215,7 @@ func applyRetention(ctx context.Context, op lockOpType, target, versionID string
 
 	lstOptions := ListOptions{Recursive: isRecursive, ShowDir: DirNone}
 	if !timeRef.IsZero() {
-		lstOptions.WithOlderVersions = withOlderVersions
+		lstOptions.WithOlderVersions = withVersions
 		lstOptions.WithDeleteMarkers = true
 		lstOptions.TimeRef = timeRef
 	}
@@ -236,7 +235,7 @@ func applyRetention(ctx context.Context, op lockOpType, target, versionID string
 			continue
 		}
 
-		if !isRecursive && alias+getKey(content) != getStandardizedURL(target) {
+		if !isRecursive && getStandardizedURL(alias+getKey(content)) != getStandardizedURL(target) {
 			break
 		}
 
@@ -250,7 +249,7 @@ func applyRetention(ctx context.Context, op lockOpType, target, versionID string
 	}
 
 	if !atLeastOneRetentionApplied {
-		errorIf(errDummy().Trace(clnt.GetURL().String()), "Unable to find any object/version to "+string(op)+" its retention.")
+		errorIf(errDummy().Trace(clnt.GetURL().String()), "Unable to find any object/version to %s its retention.", op)
 		cErr = exitStatus(globalErrorExitStatus) // Set the exit status.
 	}
 
