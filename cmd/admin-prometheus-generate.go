@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2022 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -18,30 +18,28 @@
 package cmd
 
 import (
-	"fmt"
 	"net/url"
 	"time"
 
 	"github.com/fatih/color"
 	"github.com/minio/cli"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/v3/console"
 
 	json "github.com/minio/colorjson"
 	yaml "gopkg.in/yaml.v2"
 )
 
 const (
-	defaultJobName     = "minio-job"
-	defaultMetricsPath = "/minio/v2/metrics/cluster"
+	defaultJobName    = "minio-job"
+	metricsV2BasePath = "/minio/v2/metrics"
 )
 
-var prometheusFlags = []cli.Flag{
+var prometheusFlags = append(metricsFlags,
 	cli.BoolFlag{
 		Name:  "public",
 		Usage: "disable bearer token generation for scrape_configs",
-	},
-}
+	})
 
 var adminPrometheusGenerateCmd = cli.Command{
 	Name:            "generate",
@@ -55,15 +53,71 @@ var adminPrometheusGenerateCmd = cli.Command{
   {{.HelpName}} - {{.Usage}}
 
 USAGE:
-  {{.HelpName}} TARGET
+  {{.HelpName}} TARGET [METRIC-TYPE]
+
+METRIC-TYPE:
+  valid values are
+    api-version v2 ['cluster', 'node', 'bucket', 'resource']. defaults to 'cluster' if not specified.
+    api-version v3 ["api", "system", "debug", "cluster", "ilm", "audit", "logger", "replication", "notification", "scanner"]. defaults to all if not specified.
 
 FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}
-EXAMPLES:
+EXAMPLES (v3):
   1. Generate a default prometheus config.
-     {{.Prompt}} {{.HelpName}} myminio
+     {{.Prompt}} {{.HelpName}} play --api-version v3
 
+  2. Generate prometheus config for api metrics.
+     {{.Prompt}} {{.HelpName}} play api --api-version v3
+
+  3. Generate prometheus config for api metrics of bucket 'mybucket'.
+     {{.Prompt}} {{.HelpName}} play api --bucket mybucket --api-version v3
+
+  4. Generate prometheus config for system metrics.
+     {{.Prompt}} {{.HelpName}} play system --api-version v3
+
+  5. Generate prometheus config for debug metrics.
+     {{.Prompt}} {{.HelpName}} play debug --api-version v3
+
+  6. Generate prometheus config for cluster metrics.
+     {{.Prompt}} {{.HelpName}} play cluster --api-version v3
+
+  7. Generate prometheus config for ilm metrics.
+     {{.Prompt}} {{.HelpName}} play ilm --api-version v3
+
+  8. Generate prometheus config for audit metrics.
+     {{.Prompt}} {{.HelpName}} play audit --api-version v3
+
+  9. Generate prometheus config for logger metrics.
+     {{.Prompt}} {{.HelpName}} play logger --api-version v3
+
+  10. Generate prometheus config for replication metrics.
+     {{.Prompt}} {{.HelpName}} play replication --api-version v3
+
+  11. Generate prometheus config for replication metrics of bucket 'mybucket'.
+     {{.Prompt}} {{.HelpName}} play replication --bucket mybucket --api-version v3
+
+  12. Generate prometheus config for notification metrics.
+     {{.Prompt}} {{.HelpName}} play notification --api-version v3
+
+  13. Generate prometheus config for scanner metrics.
+     {{.Prompt}} {{.HelpName}} play scanner --api-version v3
+
+EXAMPLES (v2):
+  1. Generate a default prometheus config.
+     {{.Prompt}} {{.HelpName}} play
+
+  2. Generate prometheus config for node metrics.
+     {{.Prompt}} {{.HelpName}} play node
+
+  3. Generate prometheus config for bucket metrics.
+     {{.Prompt}} {{.HelpName}} play bucket
+
+  4. Generate prometheus config for resource metrics.
+     {{.Prompt}} {{.HelpName}} play resource
+
+  5. Generate prometheus config for cluster metrics.
+     {{.Prompt}} {{.HelpName}} play cluster
 `,
 }
 
@@ -74,10 +128,9 @@ type PrometheusConfig struct {
 
 // String colorized prometheus config yaml.
 func (c PrometheusConfig) String() string {
-	b, err := yaml.Marshal(c)
-	if err != nil {
-		return fmt.Sprintf("error creating config string: %s", err)
-	}
+	b, e := yaml.Marshal(c)
+	fatalIf(probe.NewError(e), "Unable to generate Prometheus config")
+
 	return console.Colorize("yaml", string(b))
 }
 
@@ -95,10 +148,9 @@ type StatConfig struct {
 
 // String colorized stat config yaml.
 func (t StatConfig) String() string {
-	b, err := yaml.Marshal(t)
-	if err != nil {
-		return fmt.Sprintf("error creating config string: %s", err)
-	}
+	b, e := yaml.Marshal(t)
+	fatalIf(probe.NewError(e), "Unable to generate Prometheus config")
+
 	return console.Colorize("yaml", string(b))
 }
 
@@ -122,23 +174,9 @@ const (
 	defaultPrometheusJWTExpiry = 100 * 365 * 24 * time.Hour
 )
 
-var defaultConfig = PrometheusConfig{
-	ScrapeConfigs: []ScrapeConfig{
-		{
-			JobName:     defaultJobName,
-			MetricsPath: defaultMetricsPath,
-			StaticConfigs: []StatConfig{
-				{
-					Targets: []string{""},
-				},
-			},
-		},
-	},
-}
-
 // checkAdminPrometheusSyntax - validate all the passed arguments
 func checkAdminPrometheusSyntax(ctx *cli.Context) {
-	if len(ctx.Args()) != 1 {
+	if len(ctx.Args()) == 0 || len(ctx.Args()) > 2 {
 		showCommandHelpAndExit(ctx, 1) // last argument is exit code
 	}
 }
@@ -163,18 +201,58 @@ func generatePrometheusConfig(ctx *cli.Context) error {
 		return e
 	}
 
+	metricsSubSystem := args.Get(1)
+	apiVer := ctx.String("api-version")
+	jobName := defaultJobName
+	metricsPath := ""
+
+	switch apiVer {
+	case "v2":
+		if metricsSubSystem == "" {
+			metricsSubSystem = "cluster"
+		}
+		validateV2Args(ctx, metricsSubSystem)
+		if metricsSubSystem != "cluster" {
+			jobName = defaultJobName + "-" + metricsSubSystem
+		}
+		metricsPath = metricsV2BasePath + "/" + metricsSubSystem
+	case "v3":
+		bucket := ctx.String("bucket")
+		validateV3Args(metricsSubSystem, bucket)
+		metricsPath = getMetricsV3Path(metricsSubSystem, bucket)
+		if metricsSubSystem != "" {
+			jobName = defaultJobName + "-" + metricsSubSystem
+		}
+	default:
+		fatalIf(errInvalidArgument().Trace(), "Invalid api version `"+apiVer+"`")
+	}
+
+	config := PrometheusConfig{
+		ScrapeConfigs: []ScrapeConfig{
+			{
+				JobName:     jobName,
+				MetricsPath: metricsPath,
+				StaticConfigs: []StatConfig{
+					{
+						Targets: []string{""},
+					},
+				},
+			},
+		},
+	}
+
 	if !ctx.Bool("public") {
 		token, e := getPrometheusToken(hostConfig)
 		if e != nil {
 			return e
 		}
 		// Setting the values
-		defaultConfig.ScrapeConfigs[0].BearerToken = token
+		config.ScrapeConfigs[0].BearerToken = token
 	}
-	defaultConfig.ScrapeConfigs[0].Scheme = u.Scheme
-	defaultConfig.ScrapeConfigs[0].StaticConfigs[0].Targets[0] = u.Host
+	config.ScrapeConfigs[0].Scheme = u.Scheme
+	config.ScrapeConfigs[0].StaticConfigs[0].Targets[0] = u.Host
 
-	printMsg(defaultConfig)
+	printMsg(config)
 
 	return nil
 }

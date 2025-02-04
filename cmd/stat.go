@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2022 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -29,29 +29,32 @@ import (
 
 	"github.com/dustin/go-humanize"
 	json "github.com/minio/colorjson"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/lifecycle"
 	"github.com/minio/minio-go/v7/pkg/notification"
 	"github.com/minio/minio-go/v7/pkg/replication"
-	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 // contentMessage container for content message structure.
 type statMessage struct {
-	Status            string            `json:"status"`
-	Key               string            `json:"name"`
-	Date              time.Time         `json:"lastModified"`
-	Size              int64             `json:"size"`
-	ETag              string            `json:"etag"`
-	Type              string            `json:"type,omitempty"`
-	Expires           *time.Time        `json:"expires,omitempty"`
-	Expiration        *time.Time        `json:"expiration,omitempty"`
-	ExpirationRuleID  string            `json:"expirationRuleID,omitempty"`
-	ReplicationStatus string            `json:"replicationStatus,omitempty"`
-	Metadata          map[string]string `json:"metadata,omitempty"`
-	VersionID         string            `json:"versionID,omitempty"`
-	DeleteMarker      bool              `json:"deleteMarker,omitempty"`
+	Status            string             `json:"status"`
+	Key               string             `json:"name"`
+	Date              time.Time          `json:"lastModified"`
+	Size              int64              `json:"size"`
+	ETag              string             `json:"etag"`
+	Type              string             `json:"type,omitempty"`
+	Expires           *time.Time         `json:"expires,omitempty"`
+	Expiration        *time.Time         `json:"expiration,omitempty"`
+	ExpirationRuleID  string             `json:"expirationRuleID,omitempty"`
+	ReplicationStatus string             `json:"replicationStatus,omitempty"`
+	Metadata          map[string]string  `json:"metadata,omitempty"`
+	VersionID         string             `json:"versionID,omitempty"`
+	DeleteMarker      bool               `json:"deleteMarker,omitempty"`
+	Restore           *minio.RestoreInfo `json:"restore,omitempty"`
+	Checksum          map[string]string  `json:"checksum,omitempty"`
 }
 
 func (stat statMessage) String() (msg string) {
@@ -59,8 +62,13 @@ func (stat statMessage) String() (msg string) {
 	// Format properly for alignment based on maxKey leng
 	stat.Key = fmt.Sprintf("%-10s: %s", "Name", stat.Key)
 	msgBuilder.WriteString(console.Colorize("Name", stat.Key) + "\n")
-	msgBuilder.WriteString(fmt.Sprintf("%-10s: %s ", "Date", stat.Date.Format(printDate)) + "\n")
-	msgBuilder.WriteString(fmt.Sprintf("%-10s: %-6s ", "Size", humanize.IBytes(uint64(stat.Size))) + "\n")
+	if !stat.Date.IsZero() && !stat.Date.Equal(timeSentinel) {
+		msgBuilder.WriteString(fmt.Sprintf("%-10s: %s ", "Date", stat.Date.Format(printDate)) + "\n")
+	}
+	if stat.Type != "folder" {
+		msgBuilder.WriteString(fmt.Sprintf("%-10s: %-6s ", "Size", humanize.IBytes(uint64(stat.Size))) + "\n")
+	}
+
 	if stat.ETag != "" {
 		msgBuilder.WriteString(fmt.Sprintf("%-10s: %s ", "ETag", stat.ETag) + "\n")
 	}
@@ -72,12 +80,25 @@ func (stat statMessage) String() (msg string) {
 		msgBuilder.WriteString(fmt.Sprintf("%-10s: %s ", "VersionID", versionIDField) + "\n")
 	}
 	msgBuilder.WriteString(fmt.Sprintf("%-10s: %s ", "Type", stat.Type) + "\n")
-	if stat.Expires != nil {
+	if stat.Expires != nil && !stat.Expires.IsZero() && !stat.Expires.Equal(timeSentinel) {
 		msgBuilder.WriteString(fmt.Sprintf("%-10s: %s ", "Expires", stat.Expires.Format(printDate)) + "\n")
 	}
-	if stat.Expiration != nil {
+	if stat.Expiration != nil && !stat.Expiration.IsZero() && !stat.Expiration.Equal(timeSentinel) {
 		msgBuilder.WriteString(fmt.Sprintf("%-10s: %s (lifecycle-rule-id: %s) ", "Expiration",
 			stat.Expiration.Local().Format(printDate), stat.ExpirationRuleID) + "\n")
+	}
+	if len(stat.Checksum) > 0 {
+		cs := strings.TrimSuffix(strings.TrimPrefix(fmt.Sprintf("%v", stat.Checksum), "map["), "]")
+		msgBuilder.WriteString(fmt.Sprintf("%-10s: %v", "Checksum", cs) + "\n")
+	}
+	if stat.Restore != nil {
+		msgBuilder.WriteString(fmt.Sprintf("%-10s:", "Restore") + "\n")
+		if !stat.Restore.ExpiryTime.IsZero() && !stat.Restore.ExpiryTime.Equal(timeSentinel) {
+			msgBuilder.WriteString(fmt.Sprintf("  %-10s: %s", "ExpiryTime",
+				stat.Restore.ExpiryTime.Local().Format(printDate)) + "\n")
+		}
+		msgBuilder.WriteString(fmt.Sprintf("  %-10s: %t", "Ongoing",
+			stat.Restore.OngoingRestore) + "\n")
 	}
 	maxKeyMetadata := 0
 	maxKeyEncrypted := 0
@@ -93,6 +114,35 @@ func (stat statMessage) String() (msg string) {
 			}
 		}
 	}
+
+	if maxKeyEncrypted > 0 {
+		// Handle various AWS S3 headers, behaviors etc.
+		var found bool
+		if enabled, ok := stat.Metadata["X-Amz-Server-Side-Encryption-Bucket-Key-Enabled"]; ok {
+			if enabled == "true" {
+				msgBuilder.WriteString(fmt.Sprintf("%-10s: SSE-%s\n", "Encryption", "KMS"))
+			}
+			// we still need to treat this as 'true' because X-Amz-Server-Side-Encryption-Bucket-Key-Enabled
+			// can be set to 'false' by the server to indicate there is no SSE enabled on the object
+			// we shouldn't be printing `unknown` in that scenario.
+			found = true
+		} else if keyID, ok := stat.Metadata["X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id"]; ok {
+			msgBuilder.WriteString(fmt.Sprintf("%-10s: SSE-%s (%s)\n", "Encryption", "KMS", keyID))
+			found = true
+		} else if _, ok := stat.Metadata["X-Amz-Server-Side-Encryption-Customer-Key-Md5"]; ok {
+			msgBuilder.WriteString(fmt.Sprintf("%-10s: SSE-%s\n", "Encryption", "C"))
+			found = true
+		} else if algo, ok := stat.Metadata["X-Amz-Server-Side-Encryption"]; ok && algo == "AES256" {
+			msgBuilder.WriteString(fmt.Sprintf("%-10s: SSE-%s\n", "Encryption", "S3"))
+			found = true
+		}
+		if !found {
+			// encryption headers are present but not something we recognize, check `mc stat --debug`
+			// to obtain more information and understand if we are missing something.
+			msgBuilder.WriteString(fmt.Sprintf("%-10s: SSE-%s\n", "Encryption", "Unknown"))
+		}
+	}
+
 	if maxKeyMetadata > 0 {
 		msgBuilder.WriteString(fmt.Sprintf("%-10s:", "Metadata") + "\n")
 		for k, v := range stat.Metadata {
@@ -103,17 +153,11 @@ func (stat statMessage) String() (msg string) {
 		}
 	}
 
-	if maxKeyEncrypted > 0 {
-		msgBuilder.WriteString(fmt.Sprintf("%-10s:", "Encrypted") + "\n")
-		for k, v := range stat.Metadata {
-			if strings.HasPrefix(strings.ToLower(k), serverEncryptionKeyPrefix) {
-				msgBuilder.WriteString(fmt.Sprintf("  %-*.*s: %s ", maxKeyEncrypted, maxKeyEncrypted, k, v) + "\n")
-			}
-		}
-	}
 	if stat.ReplicationStatus != "" {
 		msgBuilder.WriteString(fmt.Sprintf("%-10s: %s ", "Replication Status", stat.ReplicationStatus))
 	}
+
+	msgBuilder.WriteString("\n")
 
 	return msgBuilder.String()
 }
@@ -152,6 +196,8 @@ func parseStat(c *ClientContent) statMessage {
 	}
 	content.ExpirationRuleID = c.ExpirationRuleID
 	content.ReplicationStatus = c.ReplicationStatus
+	content.Restore = c.Restore
+	content.Checksum = c.Checksum
 	return content
 }
 
@@ -163,19 +209,85 @@ func getStandardizedURL(targetURL string) string {
 // statURL - uses combination of GET listing and HEAD to fetch information of one or more objects
 // HEAD can fail with 400 with an SSE-C encrypted object but we still return information gathered
 // from GET listing.
-func statURL(ctx context.Context, targetURL, versionID string, timeRef time.Time, includeOlderVersions, isIncomplete, isRecursive bool, encKeyDB map[string][]prefixSSEPair) *probe.Error {
+func statURL(ctx context.Context, targetURL, versionID string, timeRef time.Time, includeOlderVersions, isIncomplete, isRecursive, headOnly bool, encKeyDB map[string][]prefixSSEPair) *probe.Error {
 	clnt, err := newClient(targetURL)
 	if err != nil {
 		return err
 	}
 
 	targetAlias, _, _ := mustExpandAlias(targetURL)
-
-	prefixPath := clnt.GetURL().Path
 	separator := string(clnt.GetURL().Separator)
-	if !strings.HasSuffix(prefixPath, separator) {
+	prefixPath := clnt.GetURL().Path
+	hasTrailingSlash := strings.HasSuffix(prefixPath, separator)
+
+	if !hasTrailingSlash {
 		prefixPath = prefixPath[:strings.LastIndex(prefixPath, separator)+1]
 	}
+
+	if headOnly || versionID != "" {
+		url := getStandardizedURL(targetURL)
+
+		_, stat, err := url2Stat(ctx, url2StatOptions{
+			urlStr: url, versionID: versionID,
+			fileAttr: true, encKeyDB: encKeyDB,
+			timeRef: timeRef, isZip: false,
+			ignoreBucketExistsCheck: false,
+			headOnly:                headOnly,
+		})
+		if err != nil {
+			return err
+		}
+
+		// Convert any os specific delimiters to "/".
+		contentURL := filepath.ToSlash(stat.URL.Path)
+
+		// Trim prefix path from the content path.
+		stat.URL.Path = strings.TrimPrefix(contentURL, filepath.ToSlash(prefixPath))
+
+		printMsg(parseStat(stat))
+		return nil
+	}
+
+	// if stat is on a bucket and non-recursive mode, serve the bucket metadata
+	if !isRecursive && !hasTrailingSlash {
+		bstat, err := clnt.GetBucketInfo(ctx)
+		if err == nil {
+			// Convert any os specific delimiters to "/".
+			contentURL := filepath.ToSlash(bstat.URL.Path)
+			prefixPath = filepath.ToSlash(prefixPath)
+			// Trim prefix path from the content path.
+			contentURL = strings.TrimPrefix(contentURL, prefixPath)
+			bstat.URL.Path = contentURL
+
+			if bstat.Date.IsZero() || bstat.Date.Equal(timeSentinel) {
+				bstat.Date = time.Now()
+			}
+
+			var bu madmin.BucketUsageInfo
+
+			adminClient, _ := newAdminClient(targetURL)
+			if adminClient != nil {
+				// Create a new MinIO Admin Client
+				duinfo, e := adminClient.DataUsageInfo(ctx)
+				if e == nil {
+					bu = duinfo.BucketsUsage[bstat.Key]
+				}
+			}
+
+			if prefixPath != "/" {
+				bstat.Prefix = true
+			}
+
+			printMsg(bucketInfoMessage{
+				Status:     "success",
+				BucketInfo: bstat,
+				Usage:      bu,
+			})
+
+			return nil
+		}
+	}
+
 	lstOptions := ListOptions{Recursive: isRecursive, Incomplete: isIncomplete, ShowDir: DirNone}
 	switch {
 	case versionID != "":
@@ -186,7 +298,9 @@ func statURL(ctx context.Context, targetURL, versionID string, timeRef time.Time
 		lstOptions.WithDeleteMarkers = true
 		lstOptions.TimeRef = timeRef
 	}
+
 	var e error
+	var found int
 	for content := range clnt.List(ctx, lstOptions) {
 		if content.Err != nil {
 			switch content.Err.ToGoError().(type) {
@@ -208,15 +322,16 @@ func statURL(ctx context.Context, targetURL, versionID string, timeRef time.Time
 			e = exitStatus(globalErrorExitStatus) // Set the exit status.
 			continue
 		}
+		found++
 
 		if content.StorageClass == s3StorageClassGlacier {
 			continue
 		}
 
-		url := targetAlias + getKey(content)
+		url := getStandardizedURL(targetAlias + getKey(content))
 		standardizedURL := getStandardizedURL(targetURL)
 
-		if !isRecursive && !strings.HasPrefix(url, standardizedURL) && !filepath.IsAbs(url) {
+		if !isRecursive && !strings.HasPrefix(filepath.FromSlash(url), standardizedURL) && !filepath.IsAbs(url) {
 			return errTargetNotFound(targetURL).Trace(url, standardizedURL)
 		}
 
@@ -225,32 +340,14 @@ func statURL(ctx context.Context, targetURL, versionID string, timeRef time.Time
 				continue
 			}
 		}
-		clnt, stat, err := url2Stat(ctx, url, content.VersionID, true, encKeyDB, timeRef, false)
+		_, stat, err := url2Stat(ctx, url2StatOptions{
+			urlStr: url, versionID: content.VersionID,
+			fileAttr: true, encKeyDB: encKeyDB,
+			timeRef: timeRef, isZip: false,
+			ignoreBucketExistsCheck: false,
+		})
 		if err != nil {
-			continue
-		}
-
-		// if stat is on a bucket and non-recursive mode, serve the bucket metadata
-		if clnt != nil && !isRecursive && stat.Type.IsDir() {
-			bstat, err := clnt.GetBucketInfo(ctx)
-			if err == nil {
-				// Convert any os specific delimiters to "/".
-				contentURL := filepath.ToSlash(bstat.URL.Path)
-				prefixPath = filepath.ToSlash(prefixPath)
-				// Trim prefix path from the content path.
-				contentURL = strings.TrimPrefix(contentURL, prefixPath)
-				bstat.URL.Path = contentURL
-
-				if bstat.Date.IsZero() || bstat.Date.Equal(time.Unix(0, 0)) {
-					bstat.Date = content.Time
-				}
-
-				printMsg(bucketInfoMessage{
-					Status:     "success",
-					BucketInfo: bstat,
-				})
-				continue
-			}
+			return err.Trace(url)
 		}
 
 		// Convert any os specific delimiters to "/".
@@ -263,6 +360,10 @@ func statURL(ctx context.Context, targetURL, versionID string, timeRef time.Time
 		printMsg(parseStat(stat))
 	}
 
+	if found <= 0 {
+		return probe.NewError(ObjectMissing{timeRef})
+	}
+
 	return probe.NewError(e)
 }
 
@@ -273,6 +374,7 @@ type BucketInfo struct {
 	Date       time.Time   `json:"lastModified"`
 	Size       int64       `json:"size"`
 	Type       os.FileMode `json:"-"`
+	Prefix     bool        `json:"-"`
 	Versioning struct {
 		Status    string `json:"status"`
 		MFADelete string `json:"MFADelete"`
@@ -326,6 +428,7 @@ func (i BucketInfo) Tags() string {
 type bucketInfoMessage struct {
 	Status string `json:"status"`
 	BucketInfo
+	Usage madmin.BucketUsageInfo
 }
 
 func (v bucketInfoMessage) JSON() string {
@@ -341,24 +444,73 @@ func (v bucketInfoMessage) JSON() string {
 	return buf.String()
 }
 
+func countDigits(num uint64) (count uint) {
+	for num > 0 {
+		num /= 10
+		count++
+	}
+	return
+}
+
 func (v bucketInfoMessage) String() string {
 	var b strings.Builder
 
 	keyStr := getKey(&ClientContent{URL: v.URL, Type: v.Type})
+	keyStr = strings.TrimSuffix(keyStr, slashSeperator)
 	key := fmt.Sprintf("%-10s: %s", "Name", keyStr)
-	b.WriteString(console.Colorize("Name", key) + "\n")
-	b.WriteString(fmt.Sprintf("%-10s: %s ", "Date", v.Date.Format(printDate)) + "\n")
-	b.WriteString(fmt.Sprintf("%-10s: %-6s \n", "Size", humanize.IBytes(uint64(v.Size))))
+	b.WriteString(console.Colorize("Title", key) + "\n")
+	if !v.Date.IsZero() && !v.Date.Equal(timeSentinel) {
+		b.WriteString(fmt.Sprintf("%-10s: %s ", "Date", v.Date.Format(printDate)) + "\n")
+	}
+	b.WriteString(fmt.Sprintf("%-10s: %-6s \n", "Size", "N/A"))
 
 	fType := func() string {
+		if v.Prefix {
+			return "prefix"
+		}
 		if v.Type.IsDir() {
 			return "folder"
 		}
 		return "file"
 	}()
 	b.WriteString(fmt.Sprintf("%-10s: %s \n", "Type", fType))
-	b.WriteString(fmt.Sprintf("%-10s:\n", "Metadata"))
-	b.WriteString(prettyPrintBucketMetadata(v.BucketInfo))
+	fmt.Fprintf(&b, "\n")
+
+	if !v.Prefix {
+		fmt.Fprint(&b, console.Colorize("Title", "Properties:\n"))
+		fmt.Fprint(&b, prettyPrintBucketMetadata(v.BucketInfo))
+		fmt.Fprintf(&b, "\n")
+	}
+
+	fmt.Fprint(&b, console.Colorize("Title", "Usage:\n"))
+
+	fmt.Fprintf(&b, "%16s: %s\n", "Total size", console.Colorize("Count", humanize.IBytes(v.Usage.Size)))
+	fmt.Fprintf(&b, "%16s: %s\n", "Objects count", console.Colorize("Count", humanize.Comma(int64(v.Usage.ObjectsCount))))
+	fmt.Fprintf(&b, "%16s: %s\n", "Versions count", console.Colorize("Count", humanize.Comma(int64(v.Usage.VersionsCount))))
+	fmt.Fprintf(&b, "\n")
+
+	if len(v.Usage.ObjectSizesHistogram) > 0 {
+		fmt.Fprint(&b, console.Colorize("Title", "Object sizes histogram:\n"))
+
+		var maxDigits uint
+		for _, val := range v.Usage.ObjectSizesHistogram {
+			if d := countDigits(val); d > maxDigits {
+				maxDigits = d
+			}
+		}
+
+		var sortedTags []string
+		for k := range v.Usage.ObjectSizesHistogram {
+			sortedTags = append(sortedTags, k)
+		}
+		sort.Strings(sortedTags)
+		for _, tagName := range sortedTags {
+			val, ok := v.Usage.ObjectSizesHistogram[tagName]
+			if ok {
+				fmt.Fprintf(&b, "   %*d object(s) %s\n", maxDigits, val, tagName)
+			}
+		}
+	}
 
 	return b.String()
 }
@@ -369,59 +521,66 @@ func prettyPrintBucketMetadata(info BucketInfo) string {
 	placeHolder := ""
 	if info.Encryption.Algorithm != "" {
 		fmt.Fprintf(&b, "%2s%s", placeHolder, "Encryption: ")
-		fmt.Fprintf(&b, console.Colorize("Key", "\n\tAlgorithm: "))
-		fmt.Fprintf(&b, console.Colorize("Value", info.Encryption.Algorithm))
-		fmt.Fprintf(&b, console.Colorize("Key", "\n\tKey ID: "))
-		fmt.Fprintf(&b, console.Colorize("Value", info.Encryption.KeyID))
+		if info.Encryption.Algorithm == "aws:kms" {
+			fmt.Fprint(&b, console.Colorize("Key", "\n\tKey Type: "))
+			fmt.Fprint(&b, console.Colorize("Value", "SSE-KMS"))
+			fmt.Fprint(&b, console.Colorize("Key", "\n\tKey ID: "))
+			fmt.Fprint(&b, console.Colorize("Value", info.Encryption.KeyID))
+		} else {
+			fmt.Fprint(&b, console.Colorize("Key", "\n\tKey Type: "))
+			fmt.Fprint(&b, console.Colorize("Value", strings.ToUpper(info.Encryption.Algorithm)))
+		}
 		fmt.Fprintln(&b)
 	}
 	fmt.Fprintf(&b, "%2s%s", placeHolder, "Versioning: ")
 	if info.Versioning.Status == "" {
-		fmt.Fprintf(&b, console.Colorize("Unset", "Un-versioned"))
+		fmt.Fprint(&b, console.Colorize("Unset", "Un-versioned"))
 	} else {
-		fmt.Fprintf(&b, console.Colorize("Set", info.Versioning.Status))
+		fmt.Fprint(&b, console.Colorize("Set", info.Versioning.Status))
 	}
 	fmt.Fprintln(&b)
 
 	if info.Locking.Mode != "" {
 		fmt.Fprintf(&b, "%2s%s\n", placeHolder, "LockConfiguration: ")
 		fmt.Fprintf(&b, "%4s%s", placeHolder, "RetentionMode: ")
-		fmt.Fprintf(&b, console.Colorize("Value", info.Locking.Mode))
+		fmt.Fprint(&b, console.Colorize("Value", info.Locking.Mode))
 		fmt.Fprintln(&b)
 		fmt.Fprintf(&b, "%4s%s", placeHolder, "Retention Until Date: ")
-		fmt.Fprintf(&b, console.Colorize("Value", info.Locking.Validity))
+		fmt.Fprint(&b, console.Colorize("Value", info.Locking.Validity))
 		fmt.Fprintln(&b)
 	}
 	if len(info.Notification.Config.TopicConfigs) > 0 {
 		fmt.Fprintf(&b, "%2s%s", placeHolder, "Notification: ")
-		fmt.Fprintf(&b, console.Colorize("Set", "Set"))
+		fmt.Fprint(&b, console.Colorize("Set", "Set"))
 		fmt.Fprintln(&b)
 	}
 	if info.Replication.Enabled {
 		fmt.Fprintf(&b, "%2s%s", placeHolder, "Replication: ")
-		fmt.Fprintf(&b, console.Colorize("Set", "Enabled"))
+		fmt.Fprint(&b, console.Colorize("Set", "Enabled"))
 		fmt.Fprintln(&b)
 	}
 	fmt.Fprintf(&b, "%2s%s", placeHolder, "Location: ")
-	fmt.Fprintf(&b, console.Colorize("Generic", info.Location))
+	fmt.Fprint(&b, console.Colorize("Generic", info.Location))
 	fmt.Fprintln(&b)
-	fmt.Fprintf(&b, "%2s%s", placeHolder, "Policy: ")
+	fmt.Fprintf(&b, "%2s%s", placeHolder, "Anonymous: ")
 	if info.Policy.Type == "none" {
-		fmt.Fprintf(&b, console.Colorize("UnSet", info.Policy.Type))
+		fmt.Fprint(&b, console.Colorize("UnSet", "Disabled"))
 	} else {
-		fmt.Fprintf(&b, console.Colorize("Set", info.Policy.Type))
+		fmt.Fprint(&b, console.Colorize("Set", "Enabled"))
 	}
 	fmt.Fprintln(&b)
 	if info.Tags() != "" {
 		fmt.Fprintf(&b, "%2s%s", placeHolder, "Tagging: ")
-		fmt.Fprintf(&b, console.Colorize("Generic", info.Tags()))
+		fmt.Fprint(&b, console.Colorize("Generic", info.Tags()))
 		fmt.Fprintln(&b)
 	}
+	fmt.Fprintf(&b, "%2s%s", placeHolder, "ILM: ")
 	if info.ILM.Config != nil {
-		fmt.Fprintf(&b, "%2s%s", placeHolder, "ILM: ")
-		fmt.Fprintf(&b, console.Colorize("Set", "Set"))
-		fmt.Fprintln(&b)
+		fmt.Fprint(&b, console.Colorize("Set", "Enabled"))
+	} else {
+		fmt.Fprint(&b, console.Colorize("UnSet", "Disabled"))
 	}
+	fmt.Fprintln(&b)
 
 	return b.String()
 }

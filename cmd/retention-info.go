@@ -28,7 +28,7 @@ import (
 	json "github.com/minio/colorjson"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7"
-	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 var retentionInfoFlags = []cli.Flag{
@@ -217,9 +217,9 @@ func (m retentionInfoMessageRecord) String() string {
 
 	fmt.Fprintf(&msg, "Mode    : ")
 	if m.Mode == "" {
-		fmt.Fprintf(&msg, console.Colorize("RetentionNotFound", "NO RETENTION"))
+		fmt.Fprint(&msg, console.Colorize("RetentionNotFound", "NO RETENTION"))
 	} else {
-		fmt.Fprintf(&msg, console.Colorize("RetentionSuccess", m.Mode))
+		fmt.Fprint(&msg, console.Colorize("RetentionSuccess", m.Mode))
 		if !m.Until.IsZero() {
 			msg.WriteString(", ")
 			exp := ""
@@ -231,10 +231,10 @@ func (m retentionInfoMessageRecord) String() string {
 				prettyDuration := timeDurationToHumanizedDuration(m.Until.Sub(now)).StringShort()
 				exp = console.Colorize("RetentionSuccess", "expiring in "+prettyDuration)
 			}
-			fmt.Fprintf(&msg, exp)
+			fmt.Fprint(&msg, exp)
 		}
 	}
-	fmt.Fprintf(&msg, "\n")
+	fmt.Fprint(&msg, "\n")
 	return msg.String()
 }
 
@@ -300,7 +300,7 @@ func infoRetentionSingle(ctx context.Context, alias, url, versionID string, list
 }
 
 // Get Retention for one object/version or many objects within a given prefix.
-func getRetention(ctx context.Context, target, versionID string, timeRef time.Time, withOlderVersions, isRecursive bool) error {
+func getRetention(ctx context.Context, target, versionID string, timeRef time.Time, withVersions, isRecursive bool) error {
 	clnt, err := newClient(target)
 	if err != nil {
 		fatalIf(err.Trace(), "Unable to parse the provided url.")
@@ -314,7 +314,7 @@ func getRetention(ctx context.Context, target, versionID string, timeRef time.Ti
 	}
 
 	alias, urlStr, _ := mustExpandAlias(target)
-	if versionID != "" || !isRecursive && !withOlderVersions {
+	if versionID != "" || !isRecursive && !withVersions {
 		err := infoRetentionSingle(ctx, alias, urlStr, versionID, false)
 		if err != nil {
 			if _, ok := err.ToGoError().(ObjectNameEmpty); ok {
@@ -327,7 +327,7 @@ func getRetention(ctx context.Context, target, versionID string, timeRef time.Ti
 
 	lstOptions := ListOptions{Recursive: isRecursive, ShowDir: DirNone}
 	if !timeRef.IsZero() {
-		lstOptions.WithOlderVersions = withOlderVersions
+		lstOptions.WithOlderVersions = withVersions
 		lstOptions.WithDeleteMarkers = true
 		lstOptions.TimeRef = timeRef
 	}
@@ -346,7 +346,7 @@ func getRetention(ctx context.Context, target, versionID string, timeRef time.Ti
 			continue
 		}
 
-		if !isRecursive && alias+getKey(content) != getStandardizedURL(target) {
+		if !isRecursive && getStandardizedURL(alias+getKey(content)) != getStandardizedURL(target) {
 			break
 		}
 
@@ -381,7 +381,7 @@ func mainRetentionInfo(cliCtx *cli.Context) error {
 
 	target, versionID, recursive, rewind, withVersions, bucketMode := parseInfoRetentionArgs(cliCtx)
 
-	fatalIfBucketLockNotEnabled(ctx, target)
+	fatalIfBucketLockNotSupported(ctx, target)
 
 	if bucketMode {
 		return showBucketLock(target)

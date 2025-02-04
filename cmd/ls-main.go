@@ -26,7 +26,7 @@ import (
 	"github.com/fatih/color"
 	"github.com/minio/cli"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 // ls specific flags.
@@ -120,6 +120,7 @@ var rewindSupportedFormat = []string{
 	"2006.01.02T15:04",
 	"2006.01.02T15:04:05",
 	time.RFC3339,
+	printDate,
 }
 
 // Parse rewind flag while considering the system local time zone
@@ -157,7 +158,7 @@ func parseRewindFlag(rewind string) (timeRef time.Time) {
 }
 
 // checkListSyntax - validate all the passed arguments
-func checkListSyntax(ctx context.Context, cliCtx *cli.Context) ([]string, doListOptions) {
+func checkListSyntax(cliCtx *cli.Context) ([]string, doListOptions) {
 	args := cliCtx.Args()
 	if !cliCtx.Args().Present() {
 		args = []string{"."}
@@ -170,24 +171,24 @@ func checkListSyntax(ctx context.Context, cliCtx *cli.Context) ([]string, doList
 
 	isRecursive := cliCtx.Bool("recursive")
 	isIncomplete := cliCtx.Bool("incomplete")
-	withOlderVersions := cliCtx.Bool("versions")
+	withVersions := cliCtx.Bool("versions")
 	isSummary := cliCtx.Bool("summarize")
 	listZip := cliCtx.Bool("zip")
 
 	timeRef := parseRewindFlag(cliCtx.String("rewind"))
 
-	if listZip && (withOlderVersions || !timeRef.IsZero()) {
+	if listZip && (withVersions || !timeRef.IsZero()) {
 		fatalIf(errInvalidArgument().Trace(args...), "Zip file listing can only be performed on the latest version")
 	}
 	storageClasss := cliCtx.String("storage-class")
 	opts := doListOptions{
-		timeRef:           timeRef,
-		isRecursive:       isRecursive,
-		isIncomplete:      isIncomplete,
-		isSummary:         isSummary,
-		withOlderVersions: withOlderVersions,
-		listZip:           listZip,
-		filter:            storageClasss,
+		timeRef:      timeRef,
+		isRecursive:  isRecursive,
+		isIncomplete: isIncomplete,
+		isSummary:    isSummary,
+		withVersions: withVersions,
+		listZip:      listZip,
+		filter:       storageClasss,
 	}
 	return args, opts
 }
@@ -210,7 +211,7 @@ func mainList(cliCtx *cli.Context) error {
 	console.SetColor("SC", color.New(color.FgBlue))
 
 	// check 'ls' cliCtx arguments.
-	args, opts := checkListSyntax(ctx, cliCtx)
+	args, opts := checkListSyntax(cliCtx)
 
 	var cErr error
 	for _, targetURL := range args {
@@ -218,7 +219,7 @@ func mainList(cliCtx *cli.Context) error {
 		fatalIf(err.Trace(targetURL), "Unable to initialize target `"+targetURL+"`.")
 		if !strings.HasSuffix(targetURL, string(clnt.GetURL().Separator)) {
 			var st *ClientContent
-			st, err = clnt.Stat(ctx, StatOptions{incomplete: opts.isIncomplete})
+			st, err = clnt.Stat(ctx, StatOptions{incomplete: opts.isIncomplete, includeVersions: opts.withVersions})
 			if st != nil && err == nil && st.Type.IsDir() {
 				targetURL = targetURL + string(clnt.GetURL().Separator)
 				clnt, err = newClient(targetURL)

@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2022 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -22,7 +22,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/minio/cli"
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/mc/pkg/probe"
 )
 
@@ -103,27 +103,27 @@ func mainSupportTopAPI(ctx *cli.Context) error {
 	// Start listening on all trace activity.
 	traceCh := client.ServiceTrace(ctxt, opts)
 
-	p := tea.NewProgram(initTraceUI())
+	filteredTraces := make(chan madmin.ServiceTraceInfo, 1)
+	ui := tea.NewProgram(initTraceStatsUI(false, 30, filteredTraces))
+	var te error
 	go func() {
-		for apiCallInfo := range traceCh {
-			if apiCallInfo.Err != nil {
-				fatalIf(probe.NewError(apiCallInfo.Err), "Unable to fetch top API events")
+		for t := range traceCh {
+			if t.Err != nil {
+				te = t.Err
+				ui.Kill()
+				return
 			}
-			if matchTrace(mopts, apiCallInfo) {
-				p.Send(topAPIResult{
-					apiCallInfo: apiCallInfo,
-				})
+			if mopts.matches(t) {
+				filteredTraces <- t
 			}
-			p.Send(topAPIResult{
-				apiCallInfo: madmin.ServiceTraceInfo{},
-			})
 		}
 	}()
-
-	if e := p.Start(); e != nil {
+	if _, e := ui.Run(); e != nil {
 		cancel()
-		fatalIf(probe.NewError(e).Trace(aliasedURL), "Unable to fetch top API events")
+		if te != nil {
+			e = te
+		}
+		fatalIf(probe.NewError(e).Trace(aliasedURL), "Unable to fetch http trace statistics")
 	}
-
 	return nil
 }

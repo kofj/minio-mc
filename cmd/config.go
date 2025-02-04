@@ -28,7 +28,7 @@ import (
 	"strings"
 
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/env"
+	"github.com/minio/pkg/v3/env"
 
 	"github.com/mitchellh/go-homedir"
 )
@@ -172,7 +172,7 @@ func cleanAlias(s string) string {
 
 // isValidAlias - Check if alias valid.
 func isValidAlias(alias string) bool {
-	return regexp.MustCompile("^[a-zA-Z][a-zA-Z0-9-_]+$").MatchString(alias)
+	return regexp.MustCompile("^[a-zA-Z][a-zA-Z0-9-_]*$").MatchString(alias)
 }
 
 // getAliasConfig retrieves host specific configuration such as access keys, signature type.
@@ -185,6 +185,7 @@ func getAliasConfig(alias string) (*aliasConfigV10, *probe.Error) {
 	// if host is exact return quickly.
 	if _, ok := mcCfg.Aliases[alias]; ok {
 		hostCfg := mcCfg.Aliases[alias]
+		hostCfg.Src = mustGetMcConfigPath()
 		return &hostCfg, nil
 	}
 
@@ -194,14 +195,17 @@ func getAliasConfig(alias string) (*aliasConfigV10, *probe.Error) {
 
 // mustGetHostConfig retrieves host specific configuration such as access keys, signature type.
 func mustGetHostConfig(alias string) *aliasConfigV10 {
-	aliasCfg, _ := getAliasConfig(alias)
+	// look for it in the environment variable first.
+	aliasCfg, _ := expandAliasFromEnv(env.Get(mcEnvHostPrefix+alias, ""))
+
 	// If alias is not found,
-	// look for it in the environment variable.
-	if aliasCfg == nil {
-		aliasCfg, _ = expandAliasFromEnv(env.Get(mcEnvHostPrefix+alias, ""))
-	}
+	// look for it in the customized configuration.
 	if aliasCfg == nil {
 		aliasCfg = aliasToConfigMap[alias]
+	}
+
+	if aliasCfg == nil {
+		aliasCfg, _ = getAliasConfig(alias)
 	}
 	return aliasCfg
 }
@@ -286,6 +290,7 @@ func readAliasesFromFile(envConfigFile string) *probe.Error {
 		if err != nil {
 			return err.Trace(envLine)
 		}
+		aliasConfig.Src = envConfigFile
 		aliasToConfigMap[alias] = aliasConfig
 	}
 	if e := scanner.Err(); e != nil {
@@ -306,11 +311,12 @@ func expandAliasFromEnv(envURL string) (*aliasConfigV10, *probe.Error) {
 		AccessKey:    accessKey,
 		SecretKey:    secretKey,
 		SessionToken: sessionToken,
+		Src:          "env",
 	}, nil
 }
 
 // expandAlias expands aliased URL if any match is found, returns as is otherwise.
-func expandAlias(aliasedURL string) (alias string, urlStr string, aliasCfg *aliasConfigV10, err *probe.Error) {
+func expandAlias(aliasedURL string) (alias, urlStr string, aliasCfg *aliasConfigV10, err *probe.Error) {
 	// Extract alias from the URL.
 	alias, path := url2Alias(aliasedURL)
 
@@ -336,7 +342,7 @@ func expandAlias(aliasedURL string) (alias string, urlStr string, aliasCfg *alia
 }
 
 // mustExpandAlias expands aliased URL if any match is found, returns as is otherwise.
-func mustExpandAlias(aliasedURL string) (alias string, urlStr string, aliasCfg *aliasConfigV10) {
+func mustExpandAlias(aliasedURL string) (alias, urlStr string, aliasCfg *aliasConfigV10) {
 	alias, urlStr, aliasCfg, _ = expandAlias(aliasedURL)
 	return alias, urlStr, aliasCfg
 }

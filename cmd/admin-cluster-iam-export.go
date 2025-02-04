@@ -21,15 +21,25 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/fatih/color"
 	"github.com/minio/cli"
 	json "github.com/minio/colorjson"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/v3/console"
+)
+
+// iam export specific flags.
+var (
+	iamExportFlags = []cli.Flag{
+		cli.StringFlag{
+			Name:  "output,o",
+			Usage: "output iam export to a custom file path",
+		},
+	}
 )
 
 var adminClusterIAMExportCmd = cli.Command{
@@ -38,7 +48,7 @@ var adminClusterIAMExportCmd = cli.Command{
 	Action:          mainClusterIAMExport,
 	OnUsageError:    onUsageError,
 	Before:          setGlobalsFromContext,
-	Flags:           globalFlags,
+	Flags:           append(iamExportFlags, globalFlags...),
 	HideHelpCommand: true,
 	CustomHelpTemplate: `NAME:
   {{.HelpName}} - {{.Usage}}
@@ -52,6 +62,9 @@ FLAGS:
 EXAMPLES:
   1. Download all IAM metadata for cluster into zip file.
      {{.Prompt}} {{.HelpName}} myminio
+
+  2. Download all IAM metadata to a custom file.
+     {{.Prompt}} {{.HelpName}} myminio --output /tmp/myminio-iam.zip
 `,
 }
 
@@ -68,7 +81,9 @@ func mainClusterIAMExport(ctx *cli.Context) error {
 
 	// Get the alias parameter from cli
 	args := ctx.Args()
-	aliasedURL := args.Get(0)
+	aliasedURL := filepath.ToSlash(args.Get(0))
+	aliasedURL = filepath.Clean(aliasedURL)
+
 	console.SetColor("File", color.New(color.FgWhite, color.Bold))
 
 	// Create a new MinIO Admin Client
@@ -82,7 +97,7 @@ func mainClusterIAMExport(ctx *cli.Context) error {
 	fatalIf(probe.NewError(e).Trace(aliasedURL), "Unable to export IAM info.")
 
 	// Create iam info zip file
-	tmpFile, e := ioutil.TempFile("", fmt.Sprintf("%s-iam-info", aliasedURL))
+	tmpFile, e := os.CreateTemp("", fmt.Sprintf("%s-iam-info", aliasedURL))
 	fatalIf(probe.NewError(e), "Unable to download file data.")
 
 	ext := "zip"
@@ -95,6 +110,9 @@ func mainClusterIAMExport(ctx *cli.Context) error {
 	tmpFile.Close()
 
 	downloadPath := fmt.Sprintf("%s-iam-info.%s", aliasedURL, ext)
+	if ctx.String("output") != "" {
+		downloadPath = ctx.String("output")
+	}
 	fi, e := os.Stat(downloadPath)
 	if e == nil && !fi.IsDir() {
 		e = moveFile(downloadPath, downloadPath+"."+time.Now().Format(dateTimeFormatFilename))

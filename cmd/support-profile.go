@@ -18,18 +18,17 @@
 package cmd
 
 import (
+	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/fatih/color"
 	"github.com/minio/cli"
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 // profile command flags.
@@ -50,13 +49,43 @@ var (
 
 const profileFile = "profile.zip"
 
+type supportProfileMessage struct {
+	Status string `json:"status"`
+	File   string `json:"file,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// Colorized message for console printing.
+func (s supportProfileMessage) String() string {
+	var msg string
+	if s.Error != "" {
+		errMsg := fmt.Sprintln("Unable to upload profile file to SUBNET: ", s.Error)
+		msg := console.Colorize(supportErrorMsgTag, errMsg)
+		infoMsg := fmt.Sprintf("Profiling data saved locally at '%s'", profileFile)
+		msg += console.Colorize(supportSuccessMsgTag, infoMsg)
+		return msg
+	}
+
+	if globalAirgapped {
+		msg = fmt.Sprintf("Profiling data saved successfully at %s", s.File)
+	} else {
+		msg = "Profiling data uploaded to SUBNET successfully"
+	}
+	return console.Colorize(supportSuccessMsgTag, msg)
+}
+
+// JSON jsonified proxy remove message
+func (s supportProfileMessage) JSON() string {
+	return toJSON(s)
+}
+
 var supportProfileCmd = cli.Command{
 	Name:            "profile",
 	Usage:           "upload profile data for debugging",
 	Action:          mainSupportProfile,
 	OnUsageError:    onUsageError,
 	Before:          setGlobalsFromContext,
-	Flags:           append(profileFlags, supportGlobalFlags...),
+	Flags:           profileFlags,
 	HideHelpCommand: true,
 	CustomHelpTemplate: `NAME:
   {{.HelpName}} - {{.Usage}}
@@ -90,7 +119,9 @@ func checkAdminProfileSyntax(ctx *cli.Context) {
 		string(madmin.ProfilerTrace),
 		string(madmin.ProfilerThreads),
 		string(madmin.ProfilerGoroutines),
-		string(madmin.ProfilerCPUIO))
+		string(madmin.ProfilerCPUIO),
+		string(madmin.ProfilerRuntime),
+	)
 	// Check if the provided profiler type is known and supported
 	profilers := strings.Split(strings.ToLower(ctx.String("type")), ",")
 	for _, profiler := range profilers {
@@ -105,8 +136,8 @@ func checkAdminProfileSyntax(ctx *cli.Context) {
 		showCommandHelpAndExit(ctx, 1) // last argument is exit code
 	}
 
-	if ctx.Int("duration") < 10 {
-		fatal(errDummy().Trace(), "profiling must be run for atleast 10 seconds")
+	if ctx.Int("duration") < 1 {
+		fatal(errDummy().Trace(), "for any useful profiling one must run it for at least 1 second")
 	}
 }
 
@@ -115,31 +146,31 @@ func checkAdminProfileSyntax(ctx *cli.Context) {
 // working directory is a different partition. To allow all situations to
 // be handled appropriately use this function instead of os.Rename()
 func moveFile(sourcePath, destPath string) error {
-	inputFile, err := os.Open(sourcePath)
-	if err != nil {
-		return err
+	inputFile, e := os.Open(sourcePath)
+	if e != nil {
+		return e
 	}
 
-	outputFile, err := os.Create(destPath)
-	if err != nil {
+	outputFile, e := os.Create(destPath)
+	if e != nil {
 		inputFile.Close()
-		return err
+		return e
 	}
 	defer outputFile.Close()
 
-	_, err = io.Copy(outputFile, inputFile)
-	inputFile.Close()
-	if err != nil {
-		return err
+	if _, e = io.Copy(outputFile, inputFile); e != nil {
+		inputFile.Close()
+		return e
 	}
 
 	// The copy was successful, so now delete the original file
+	inputFile.Close()
 	return os.Remove(sourcePath)
 }
 
 func saveProfileFile(data io.ReadCloser) {
 	// Create profile zip file
-	tmpFile, e := ioutil.TempFile("", "mc-profile-")
+	tmpFile, e := os.CreateTemp("", "mc-profile-")
 	fatalIf(probe.NewError(e), "Unable to download profile data.")
 
 	// Copy zip content to target download file
@@ -169,6 +200,9 @@ func mainSupportProfile(ctx *cli.Context) error {
 	// Check for command syntax
 	checkAdminProfileSyntax(ctx)
 
+	setSuccessMessageColor()
+	setErrorMessageColor()
+
 	// Get the alias parameter from cli
 	aliasedURL := ctx.Args().Get(0)
 	alias, apiKey := initSubnetConnectivity(ctx, aliasedURL, true)
@@ -185,7 +219,7 @@ func mainSupportProfile(ctx *cli.Context) error {
 	return nil
 }
 
-func execSupportProfile(ctx *cli.Context, client *madmin.AdminClient, alias string, apiKey string) {
+func execSupportProfile(ctx *cli.Context, client *madmin.AdminClient, alias, apiKey string) {
 	var reqURL string
 	var headers map[string]string
 	profilers := ctx.String("type")
@@ -194,25 +228,41 @@ func execSupportProfile(ctx *cli.Context, client *madmin.AdminClient, alias stri
 	if !globalAirgapped {
 		// Retrieve subnet credentials (login/license) beforehand as
 		// it can take a long time to fetch the profile data
-		uploadURL := subnetUploadURL("profile", profileFile)
-		reqURL, headers = prepareSubnetUploadURL(uploadURL, alias, profileFile, apiKey)
+		uploadURL := SubnetUploadURL("profile")
+		reqURL, headers = prepareSubnetUploadURL(uploadURL, alias, apiKey)
 	}
 
-	console.Infof("Profiling '%s' for %d seconds... ", alias, duration)
+	if !globalJSON {
+		console.Infof("Profiling '%s' for %d seconds... \n", alias, duration)
+	}
 	data, e := client.Profile(globalContext, madmin.ProfilerType(profilers), time.Second*time.Duration(duration))
 	fatalIf(probe.NewError(e), "Unable to save profile data")
 
 	saveProfileFile(data)
 
-	clr := color.New(color.FgGreen, color.Bold)
 	if !globalAirgapped {
-		_, e := uploadFileToSubnet(alias, profileFile, reqURL, headers)
-		fatalIf(probe.NewError(e), "Unable to upload profile file to SUBNET portal")
-		if len(apiKey) > 0 {
-			setSubnetAPIKey(alias, apiKey)
+		_, e = (&SubnetFileUploader{
+			alias:             alias,
+			FilePath:          profileFile,
+			ReqURL:            reqURL,
+			Headers:           headers,
+			DeleteAfterUpload: true,
+		}).UploadFileToSubnet()
+		if e != nil {
+			printMsg(supportProfileMessage{
+				Status: "error",
+				Error:  e.Error(),
+				File:   profileFile,
+			})
+			return
 		}
-		clr.Println("uploaded successfully to SUBNET.")
+		printMsg(supportProfileMessage{
+			Status: "success",
+		})
 	} else {
-		clr.Printf("saved successfully at '%s'\n", profileFile)
+		printMsg(supportProfileMessage{
+			Status: "success",
+			File:   profileFile,
+		})
 	}
 }
